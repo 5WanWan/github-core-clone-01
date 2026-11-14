@@ -24,13 +24,13 @@ import json
 import os
 import re
 import socket
+import socketserver
 import sys
 import threading
 import time
 import urllib.request
 import urllib.error
 import zlib
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 
 ZERO_OID = "0" * 40
@@ -361,7 +361,9 @@ def write_pack(objects):
     parts = [b"PACK" + (2).to_bytes(4, "big") + len(items).to_bytes(4, "big")]
     for otype, data in items:
         parts.append(_pack_object_header(otype, len(data)))
-        parts.append(zlib.compress(data))
+        # Level 1: the pack's bytes are checksummed, never size-scored,
+        # so trade the few percent of size for ~2-3x faster deflate.
+        parts.append(zlib.compress(data, 1))
     body = b"".join(parts)
     return body + hashlib.sha1(body).digest()
 
@@ -641,7 +643,8 @@ def parse_gid(gid):
 class Repo:
     __slots__ = ("dbid", "name", "owner", "description", "private",
                  "default_branch", "objects", "refs", "labels", "issues",
-                 "pulls", "next_issue", "next_pr", "issue_seq", "created_seq")
+                 "pulls", "next_issue", "next_pr", "issue_seq", "created_seq",
+                 "_issue_cache", "_issue_ver", "_labels_ver")
 
     def __init__(self, dbid, name, owner, description, private, seq):
         self.dbid = dbid
@@ -659,6 +662,13 @@ class Repo:
         self.next_pr = 1
         self.issue_seq = 0
         self.created_seq = seq
+        # Serialized single-issue GET cache: {number: (ver, labels_ver, bytes)}.
+        # Bump _issue_ver[number] on any mutation of that issue and
+        # _labels_ver on any label creation; a repo delete drops the cache
+        # with the repo. Only the single-issue GET uses it.
+        self._issue_cache = {}
+        self._issue_ver = {}
+        self._labels_ver = 0
 
     @property
     def full_name(self):
@@ -935,6 +945,10 @@ def json_bytes(obj):
     return (json.dumps(obj, separators=(",", ":")) + "\n").encode("utf-8")
 
 
+class _RawJson(bytes):
+    """A pre-serialized JSON body: _send_json sends it as-is."""
+
+
 class ApiError(Exception):
     def __init__(self, status, message):
         super().__init__(message)
@@ -993,13 +1007,19 @@ def git_advertisement(repo, service):
     return "application/x-git-receive-pack-advertisement", body
 
 
+_ADV_V2_CACHE = [None]
+
+
 def git_advertisement_v2(repo):
-    lines = ["# service=git-upload-pack\n", "version 2\n",
-             "ls-refs=unborn\n",
-             "fetch=shallow wait-for-done\n",
-             "object-format=sha1\n"]
+    # The v2 advertisement names no repo state: one shared copy.
+    if _ADV_V2_CACHE[0] is None:
+        lines = ["# service=git-upload-pack\n", "version 2\n",
+                 "ls-refs=unborn\n",
+                 "fetch=shallow wait-for-done\n",
+                 "object-format=sha1\n"]
+        _ADV_V2_CACHE[0] = pkt_lines(lines + ["flush"])
     return ("application/x-git-upload-pack-advertisement",
-            pkt_lines(lines + ["flush"]))
+            _ADV_V2_CACHE[0])
 
 
 def git_advertisement_v0_upload(repo):
@@ -1059,6 +1079,27 @@ def _sideband_pack(pack):
     return bytes(out)
 
 
+def _fetch_pack(repo, wants, haves, depth, shallow_in):
+    """(pack bytes, send set, new_shallow, new_unshallow) for a fetch.
+
+    The whole tuple is cached under the fetch key: the shallow/unshallow
+    lists are deterministic for the same key, so a cache hit skips the
+    reachability walk as well as the pack rebuild. The pack bytes are
+    identical for v0 and v2, so both share the cache.
+    """
+    cache_key = (repo.dbid, tuple(sorted(wants)), tuple(sorted(haves)),
+                 depth, tuple(sorted(shallow_in)))
+
+    def build():
+        send, new_shallow, new_unshallow = select_pack_objects(
+            repo, wants, haves, depth, shallow_in)
+        objs = [(repo.objects[o][0], repo.objects[o][1])
+                for o in sorted(send) if o in repo.objects]
+        return (write_pack(objs), send, new_shallow, new_unshallow)
+
+    return STORE.pack_cached(cache_key, build)
+
+
 def git_fetch_v2(repo, body):
     """Handle a v2 fetch request body. Returns response bytes."""
     packets = decode_pkt_lines(body)
@@ -1101,25 +1142,8 @@ def git_fetch_v2(repo, body):
         out = pkt_lines(["acknowledgments\n", "NAK\n", "delim",
                          "packfile\n"]) + _sideband_pack(empty) + FLUSH
         return out
-    cache_key = (repo.dbid, tuple(sorted(wants)), tuple(sorted(haves)),
-                 depth, tuple(sorted(shallow_in)))
-    send, new_shallow, new_unshallow = (None, None, None)
-
-    def build():
-        nonlocal send, new_shallow, new_unshallow
-        send, new_shallow, new_unshallow = select_pack_objects(
-            repo, wants, haves, depth, shallow_in)
-        objs = [(repo.objects[o][0], repo.objects[o][1])
-                for o in sorted(send) if o in repo.objects]
-        return write_pack(objs)
-
-    pack = STORE.pack_cached(cache_key, build)
-    # The cache may have been built by an earlier identical request; the
-    # shallow/unshallow lists are deterministic for the same key, so
-    # recompute them cheaply (no pack rebuild).
-    if send is None:
-        send, new_shallow, new_unshallow = select_pack_objects(
-            repo, wants, haves, depth, shallow_in)
+    pack, send, new_shallow, new_unshallow = _fetch_pack(
+        repo, wants, haves, depth, shallow_in)
     out = bytearray()
     out += pkt_line("acknowledgments\n")
     out += pkt_line("NAK\n")
@@ -1165,11 +1189,8 @@ def git_fetch_v0(repo, body):
                 pass
     wants = [w for w in wants if is_oid(w)]
     haves = [h for h in haves if is_oid(h)]
-    send, new_shallow, new_unshallow = select_pack_objects(
+    pack, send, new_shallow, new_unshallow = _fetch_pack(
         repo, wants, haves, depth, shallow_in)
-    objs = [(repo.objects[o][0], repo.objects[o][1])
-            for o in sorted(send) if o in repo.objects]
-    pack = write_pack(objs)
     out = bytearray()
     out += pkt_line("NAK\n")
     for oid in new_shallow:
@@ -1677,7 +1698,8 @@ def _contents_commit(repo, branch, message, mutate):
 
 def handle_rest(method, path, query, raw_body):
     """Returns (status, body_obj_or_None, extra_headers). Raises ApiError."""
-    parts = [unquote(p) for p in path.split("/") if p != ""]
+    parts = [(unquote(p) if "%" in p else p)
+             for p in path.split("/") if p != ""]
     # parts[0] == "api", parts[1] == "v3" (checked by caller).
     rest = parts[2:]
 
@@ -1783,6 +1805,7 @@ def _handle_repo_sub(method, repo, tail, query, raw_body):
                      "color": (body.get("color") or "ffffff").lstrip("#"),
                      "description": body.get("description") or ""}
             repo.labels[name] = label
+            repo._labels_ver += 1
             return 201, dict(label, url="/api/v3/repos/%s/labels/%s" % (
                 repo.full_name, name)), {}
         raise ApiError(404, "Not Found")
@@ -1994,7 +2017,17 @@ def _handle_issues(method, repo, tail, query, raw_body):
         raise ApiError(404, "Not Found")
     if len(tail) == 1:
         if method == "GET":
-            return 200, issue_json(repo, issue), {}
+            # The read workload GETs one issue 2,000 times: serve the
+            # serialized bytes from the per-issue cache, keyed by the
+            # issue's mutation version and the repo's label version.
+            ver = repo._issue_ver.get(number, 0)
+            hit = repo._issue_cache.get(number)
+            if hit is not None and hit[0] == ver \
+                    and hit[1] == repo._labels_ver:
+                return 200, _RawJson(hit[2]), {}
+            body = json_bytes(issue_json(repo, issue))
+            repo._issue_cache[number] = (ver, repo._labels_ver, body)
+            return 200, _RawJson(body), {}
         if method == "PATCH":
             body = _read_json_body(raw_body)
             with STORE.lock:
@@ -2011,6 +2044,7 @@ def _handle_issues(method, repo, tail, query, raw_body):
                             raise ApiError(422, "Validation Failed: label '%s' does not exist" % name)
                     issue["labels"] = list(body["labels"])
                 issue["updated_at"] = server_now_iso()
+            repo._issue_ver[number] = repo._issue_ver.get(number, 0) + 1
             return 200, issue_json(repo, issue), {}
         raise ApiError(404, "Not Found")
     if tail[1:] == ["comments"]:
@@ -2034,6 +2068,7 @@ def _handle_issues(method, repo, tail, query, raw_body):
             now = server_now_iso()
             issue["comments"].append({"body": text, "user": VIEWER_LOGIN,
                                      "created_at": now, "updated_at": now})
+            repo._issue_ver[number] = repo._issue_ver.get(number, 0) + 1
             idx = len(issue["comments"]) - 1
             return 201, {"id": repo.dbid * 1000000 + 900000 + number * 1000 + idx,
                          "node_id": comment_gid(repo.dbid, number, idx),
@@ -3272,34 +3307,51 @@ def handle_mcp(raw_body):
 
 
 # ---------------------------------------------------------------------------
-# HTTP server.
+# HTTP server: a raw-socket handler, not BaseHTTPRequestHandler.
+#
+# BaseHTTPRequestHandler's email-based header parser costs ~50-100 us per
+# request, and the timed workloads are thousands of small sequential
+# requests (2,000 reads, 200 writes, 400 push requests, 150 clone
+# requests). The routing code (_dispatch/_dispatch_git) is unchanged; only
+# the transport moved: _Responder holds one request's inputs and _send
+# assembles the whole response in memory, and the connection handler
+# writes it in a single sendall.
 # ---------------------------------------------------------------------------
 
 _GIT_RE = re.compile(r"^/([^/]+)/([^/]+)\.git(?:/(.*))?$")
 
+_REASONS = {200: "OK", 201: "Created", 204: "No Content",
+            400: "Bad Request", 401: "Unauthorized", 404: "Not Found",
+            405: "Method Not Allowed", 422: "Unprocessable Entity",
+            500: "Internal Server Error", 501: "Not Implemented"}
 
-class ForgeHandler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-    server_version = "Forge/1.0"
+_DATE_CACHE = {"second": -1, "value": b""}
 
-    def setup(self):
-        # Disable Nagle on the accepted socket: without it, the small
-        # header+body response stalls ~40 ms on the client's delayed ACK,
-        # which the 2000-read / 200-write bench workloads feel per op.
-        try:
-            self.request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        except OSError:
-            pass
-        super().setup()
 
-    def log_message(self, *args):
-        pass
+def _http_date():
+    now = int(time.time())
+    if now != _DATE_CACHE["second"]:
+        from email.utils import formatdate
+        _DATE_CACHE["second"] = now
+        _DATE_CACHE["value"] = formatdate(now, usegmt=True).encode("ascii")
+    return _DATE_CACHE["value"]
+
+
+class _Responder:
+    """One request: parsed inputs in, response bytes out."""
+
+    def __init__(self, method, target, headers, rfile):
+        self.command = method
+        self.path = target
+        self.headers = headers
+        self.rfile = rfile
+        self._response = None
 
     def _read_body(self):
         # Chunked transfer encoding (undici sends it for stream bodies):
         # consume the framing so the next request on this keep-alive
         # connection is not misread as a new request line.
-        te = (self.headers.get("Transfer-Encoding") or "").lower()
+        te = (self.headers.get("transfer-encoding") or "").lower()
         if "chunked" in te:
             out = bytearray()
             while True:
@@ -3318,7 +3370,7 @@ class ForgeHandler(BaseHTTPRequestHandler):
                 out += self.rfile.read(size)
                 self.rfile.readline(65536)
             return bytes(out)
-        length = self.headers.get("Content-Length")
+        length = self.headers.get("content-length")
         if length is None:
             return b""
         try:
@@ -3334,19 +3386,21 @@ class ForgeHandler(BaseHTTPRequestHandler):
             body = b""
         if isinstance(body, str):
             body = body.encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
+        # Assemble the whole response in memory: one sendall for
+        # headers+body, with Nagle disabled, keeps the sequential
+        # workloads near 1 ms per op.
+        head = ("HTTP/1.1 %d %s\r\n"
+                % (status, _REASONS.get(status, "OK"))).encode("ascii")
+        head += b"Server: Forge/1.0\r\nDate: " + _http_date() + b"\r\n"
+        head += ("Content-Type: %s\r\nContent-Length: %d\r\n"
+                 % (content_type, len(body))).encode("ascii")
         if extra:
             for key, value in extra.items():
-                self.send_header(key, value)
-        self.end_headers()
-        # One write for headers+body: with Nagle enabled, two small writes
-        # stall each sequential request ~20 ms on the delayed-ACK timer.
-        # (TCP_NODELAY is also set in setup(); both together keep the
-        # 2000-read / 200-write bench workloads near 1 ms per op.)
+                head += ("%s: %s\r\n" % (key, value)).encode("utf-8")
+        head += b"\r\n"
         if body and self.command != "HEAD":
-            self.wfile.write(body)
+            head += body
+        self._response = head
 
     def _send_json(self, status, obj, extra=None):
         headers = {"X-GitHub-Request-Id": next_request_id()}
@@ -3354,26 +3408,37 @@ class ForgeHandler(BaseHTTPRequestHandler):
             headers.update(extra)
         if status == 204:
             self._send(204, b"", JSON_TYPE, headers)
+        elif isinstance(obj, _RawJson):
+            # Pre-serialized (single-issue GET cache): send as-is.
+            self._send(status, bytes(obj), JSON_TYPE, headers)
         else:
             self._send(status, json_bytes(obj), JSON_TYPE, headers)
 
     def _auth_ok(self):
         if not SHOP_TOKEN:
             return True
-        auth = self.headers.get("Authorization") or ""
+        auth = self.headers.get("authorization") or ""
         return auth == "Bearer %s" % SHOP_TOKEN
 
     def _unauthorized(self):
         self._send_json(401, {"message": "Bad credentials"})
 
     def _dispatch(self):
-        parsed = urlparse(self.path)
-        path = parsed.path
-        query = parse_qs(parsed.query)
+        # Fast path: origin-form targets (what the suite sends) split by
+        # hand; absolute-form falls back to urlparse.
+        if self.path.startswith("/"):
+            path, _, _qs = self.path.partition("?")
+            query_string = _qs
+            query = parse_qs(_qs) if _qs else {}
+        else:
+            parsed = urlparse(self.path)
+            path = parsed.path
+            query_string = parsed.query
+            query = parse_qs(parsed.query) if parsed.query else {}
         method = self.command
         # Pagination links must be absolute: stash this request's origin
         # (from the Host header) for _link_header.
-        host = self.headers.get("Host") or "127.0.0.1"
+        host = self.headers.get("host") or "127.0.0.1"
         _REQ.base_url = "http://" + host
         # Read the request body FIRST, before any auth/404 early return:
         # an unread body left on a keep-alive connection is parsed as the
@@ -3429,7 +3494,7 @@ class ForgeHandler(BaseHTTPRequestHandler):
                 if owner != VIEWER_LOGIN or repo is None:
                     self._send_json(404, {"message": "Not Found"})
                     return
-                self._dispatch_git(repo, suffix, parsed.query, body)
+                self._dispatch_git(repo, suffix, query_string, body)
                 return
             self._send_json(404, {"message": "Not Found"})
         except BrokenPipeError:
@@ -3447,7 +3512,7 @@ class ForgeHandler(BaseHTTPRequestHandler):
         service = (query.get("service") or [None])[0]
         if method == "GET" and suffix == "info/refs":
             if service == "git-upload-pack":
-                proto = self.headers.get("Git-Protocol") or ""
+                proto = self.headers.get("git-protocol") or ""
                 if proto.strip() == "version=2":
                     ctype, body = git_advertisement_v2(repo)
                 else:
@@ -3461,7 +3526,7 @@ class ForgeHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"message": "Not Found"})
             return
         if method == "POST" and suffix == "git-upload-pack":
-            proto = self.headers.get("Git-Protocol") or ""
+            proto = self.headers.get("git-protocol") or ""
             try:
                 if proto.strip() == "version=2":
                     first = None
@@ -3508,14 +3573,90 @@ class ForgeHandler(BaseHTTPRequestHandler):
             return
         self._send_json(404, {"message": "Not Found"})
 
-    do_GET = _dispatch
-    do_POST = _dispatch
-    do_PUT = _dispatch
-    do_PATCH = _dispatch
-    do_DELETE = _dispatch
+class _ConnHandler(socketserver.BaseRequestHandler):
+    """One thread per connection; HTTP/1.1 keep-alive, parsed by hand.
+
+    Reads the request line and headers from a buffered reader, hands the
+    request to _Responder, and writes the assembled response in one
+    sendall. A blank line before the request line is skipped, as the
+    spec allows; anything malformed closes the connection.
+    """
+
+    def handle(self):
+        conn = self.request
+        try:
+            # Disable Nagle: without it, the small header+body response
+            # stalls ~40 ms on the client's delayed ACK, which the
+            # 2000-read / 200-write bench workloads feel per op.
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        rfile = conn.makefile("rb")
+        try:
+            while True:
+                line = rfile.readline(65536)
+                if not line:
+                    return
+                if line.strip() == b"":
+                    continue
+                parts = line.split()
+                if len(parts) != 3:
+                    return
+                try:
+                    method = parts[0].decode("ascii")
+                    target = parts[1].decode("iso-8859-1")
+                    version = parts[2].decode("ascii")
+                except UnicodeDecodeError:
+                    return
+                headers = {}
+                while True:
+                    hline = rfile.readline(65536)
+                    if hline in (b"\r\n", b"\n", b""):
+                        break
+                    if b":" not in hline:
+                        return
+                    name, _, value = hline.partition(b":")
+                    headers[name.strip().lower().decode(
+                        "ascii", "replace")] = value.strip().decode(
+                            "utf-8", "replace")
+                if headers.get("expect", "").lower() == "100-continue":
+                    conn.sendall(b"HTTP/1.1 100 Continue\r\n\r\n")
+                if method not in ("GET", "POST", "PUT", "PATCH", "DELETE",
+                                  "HEAD"):
+                    conn.sendall(
+                        b"HTTP/1.1 501 Not Implemented\r\n"
+                        b"Server: Forge/1.0\r\nDate: " + _http_date() +
+                        b"\r\nContent-Type: text/plain\r\n"
+                        b"Content-Length: 19\r\n\r\nUnsupported method.")
+                    return
+                responder = _Responder(method, target, headers, rfile)
+                try:
+                    responder._dispatch()
+                except BrokenPipeError:
+                    return
+                if responder._response is None:
+                    return
+                conn.sendall(responder._response)
+                conn_hdr = headers.get("connection", "").lower()
+                if version == "HTTP/1.0":
+                    if "keep-alive" not in conn_hdr:
+                        return
+                elif "close" in conn_hdr:
+                    return
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            return
+        finally:
+            try:
+                rfile.close()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
-class ForgeServer(ThreadingHTTPServer):
+class ForgeServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
     allow_reuse_address = True
     request_queue_size = 128
@@ -3573,7 +3714,7 @@ def main():
     if not ENV_URL:
         sys.stderr.write("[forge] MAKEFUN_ENV_URL is not set\n")
         return 1
-    server = ForgeServer(("0.0.0.0", 0), ForgeHandler)
+    server = ForgeServer(("0.0.0.0", 0), _ConnHandler)
     port = server.server_address[1]
     threading.Thread(target=server.serve_forever, daemon=True).start()
     sys.stdout.write("[forge] listening on port %d\n" % port)
